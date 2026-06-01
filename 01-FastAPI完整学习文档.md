@@ -24,7 +24,8 @@
 16. [测试](#16-测试)
 17. [部署](#17-部署)
 18. [最佳实践与项目结构](#18-最佳实践与项目结构)
-19. [参考链接](#19-参考链接)
+19. [常见错误排查](#19-常见错误排查)
+20. [参考链接](#20-参考链接)
 
 ---
 
@@ -78,7 +79,45 @@ uv remove <package>
 
 ## 2. FastAPI 基础
 
-### 2.1 应用实例
+### 2.1 核心概念：ASGI 与异步
+
+在学习代码之前，先理解 FastAPI 的根基——ASGI。
+
+**什么是 ASGI？**
+
+ASGI（Asynchronous Server Gateway Interface）是 Python 的异步 Web 服务器接口标准。它解决了传统 WSGI（如 Flask/Django 用的）不能处理 WebSocket、长连接、并发请求的问题。
+
+```
+传统 WSGI:  请求 → 处理 → 返回（同步，一次一个）
+ASGI:       请求 → 处理 → 返回（异步，可同时处理多个）
+
+FastAPI  →  基于 ASGI  →  支持异步 →  高并发 + WebSocket
+Flask    →  基于 WSGI  →  同步     →  简单但并发弱
+```
+
+**为什么用异步？**
+
+```python
+# 同步方式：2 个请求依次处理，共 4 秒
+# 请求1：开始 → 查数据库(2秒) → 返回
+# 请求2：                        开始 → 查数据库(2秒) → 返回
+
+# 异步方式：2 个请求同时处理，共 2 秒
+# 请求1：开始 → 查数据库(2秒，等待时不阻塞) → 返回
+# 请求2：开始 → 查数据库(2秒，等待时不阻塞) → 返回
+```
+
+异步编程的核心思想：**等待 I/O（数据库查询、HTTP 请求、文件读写）时，CPU 不空闲等着，而是去处理其他请求**。这就是 FastAPI 能支撑高并发的根本原因。
+
+**请求在 FastAPI 中的完整流程：**
+
+```
+客户端 → Uvicorn(ASGI服务器) → 中间件1 → 中间件2 → 路由匹配
+→ 依赖注入解析 → 参数校验(Pydantic) → 路由函数执行
+→ 响应模型转换 → 中间件2 → 中间件1 → 响应给客户端
+```
+
+### 2.2 应用实例
 
 ```python
 from fastapi import FastAPI
@@ -93,7 +132,24 @@ async def root():
 
 只有 `app` 实例是必须的，`title`/`version` 等参数用于生成 OpenAPI 文档。
 
-### 2.2 lifespan 生命周期
+`async def` 定义异步路由。如果不需要在函数内 `await` 异步操作，也可以用 `def`：
+
+```python
+@app.get("/sync")
+def sync_route():
+    # 纯计算、无 I/O 等待的操作，用 def 即可
+    return {"message": "sync"}
+
+@app.get("/async")
+async def async_route():
+    # 涉及数据库查询、HTTP 请求等 I/O 操作，用 async def
+    result = await db_query()
+    return {"message": "async"}
+```
+
+FastAPI 会自动在独立线程中运行 `def` 路由，不会阻塞主循环。
+
+### 2.3 lifespan 生命周期
 
 控制应用启动和关闭时的行为：
 
@@ -543,32 +599,45 @@ async def read_root(
 
 ## 5. 依赖注入
 
-### 5.1 基础用法
+### 5.1 为什么需要依赖注入？
+
+依赖注入的目的是**解耦**和**复用**。看一个反面例子：
 
 ```python
-from fastapi import Depends
-
-
-async def common_params(
-    skip: int = 0,
-    limit: int = 10,
-):
-    return {"skip": skip, "limit": limit}
-
-
+# ❌ 不好的做法：每个路由自己创建数据库连接
 @app.get("/items/")
-async def list_items(params: dict = Depends(common_params)):
-    return params
-
+async def list_items():
+    db = create_connection()   # 重复代码
+    items = db.query(...)
+    db.close()
+    return items
 
 @app.get("/users/")
-async def list_users(params: dict = Depends(common_params)):
-    return params
+async def list_users():
+    db = create_connection()   # 重复代码
+    users = db.query(...)
+    db.close()
+    return users
+
+# ✅ 依赖注入：由 FastAPI 统一管理
+@app.get("/items/")
+async def list_items(db: Session = Depends(get_db)):  # 注入
+    return db.query(...)
+
+@app.get("/users/")
+async def list_users(db: Session = Depends(get_db)):   # 复用
+    return db.query(...)
 ```
 
-`Depends` 让 FastAPI 调用 `common_params` 并将返回值注入到路由函数。
+依赖注入的好处：
+- **复用**：相同的逻辑（数据库连接、认证、分页）只写一次
+- **测试**：注入 mock 对象，无需修改路由代码
+- **可替换**：修改数据库驱动时只需改依赖函数，不用改所有路由
+- **生命周期管理**：FastAPI 自动处理资源的创建和释放（如关闭数据库连接）
 
-### 5.2 类作为依赖
+### 5.2 基础用法
+
+### 5.3 类作为依赖
 
 ```python
 from fastapi import Depends
@@ -588,7 +657,7 @@ async def list_items(pagination: Pagination = Depends()):
 
 当依赖是类时，`Depends()` 会自动实例化。
 
-### 5.3 可调用对象作为依赖
+### 5.4 可调用对象作为依赖
 
 ```python
 from fastapi import Depends
@@ -607,7 +676,7 @@ async def list_items(db=Depends(db_session)):
     pass
 ```
 
-### 5.4 依赖链
+### 5.5 依赖链
 
 ```python
 async def get_db():
@@ -630,13 +699,40 @@ async def read_current_user(current_user=Depends(get_current_user)):
 
 依赖可以嵌套依赖，FastAPI 会自动解析整个依赖树。
 
-### 5.5 全局依赖
+### 5.6 全局依赖
 
 ```python
 app = FastAPI(dependencies=[Depends(verify_token)])
 ```
 
 所有路由都会先执行 `verify_token`。
+
+### 5.7 路由级依赖（APIRouter）
+
+```python
+from fastapi import APIRouter, Depends
+
+
+# 该路由器下所有路由都会执行 get_current_user
+router = APIRouter(
+    prefix="/api/v1/admin",
+    tags=["admin"],
+    dependencies=[Depends(get_current_user)],  # 路由级依赖
+)
+
+
+# 子路由可以额外叠加依赖
+@router.get("/dashboard", dependencies=[Depends(require_admin)])
+async def dashboard():
+    return {"message": "Admin dashboard"}
+
+
+# 不同路由器的依赖互不影响
+public_router = APIRouter(prefix="/api/v1/public")  # 无认证
+admin_router = APIRouter(prefix="/api/v1/admin", dependencies=[Depends(verify_admin)])  # 需认证
+```
+
+执行顺序：`全局依赖 → 路由级依赖 → 路由函数依赖 → 路由函数`。
 
 ---
 
@@ -750,6 +846,38 @@ app.add_middleware(
 Middleware1 (request) → Middleware2 (request) → Route → Middleware2 (response) → Middleware1 (response)
 ```
 
+### 7.4 常用内置中间件
+
+```python
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
+import uuid
+
+
+# ── Gzip 压缩 ────────────────────────────────────────
+# 压缩响应体，减少传输大小
+app.add_middleware(GZipMiddleware, minimum_size=1000)  # 大于 1KB 的响应才压缩
+
+
+# ── TrustedHost 安全限制 ─────────────────────────────
+# 只允许指定 Host 的请求访问，防止 Host 头攻击
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=["localhost", "*.example.com"],
+)
+
+
+# ── 请求 ID 追踪 ─────────────────────────────────────
+# 每个请求分配唯一 ID，方便串联日志和排查问题
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+```
+
 ---
 
 ## 8. SQLAlchemy 2.0 数据库
@@ -766,7 +894,14 @@ from sqlalchemy.orm import DeclarativeBase
 
 DATABASE_URL = "mysql+aiomysql://root:root@localhost:3306/app_db"
 
-engine = create_async_engine(DATABASE_URL, echo=False)
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    pool_size=10,           # 连接池大小
+    max_overflow=20,        # 超出 pool_size 后允许的最大连接数
+    pool_pre_ping=True,     # 每次取连接前检查是否有效（避免使用已断开的连接）
+    pool_recycle=3600,      # 连接最大存活时间（秒），MySQL 默认 8 小时断开空闲连接
+)
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
@@ -1080,6 +1215,106 @@ query = select(User).options(load_only(User.id, User.username))
 # lazy="subquery"  → 自动使用 subqueryload
 #
 # 建议：在 query 时用 options() 显式指定，而不是修改模型默认 lazy
+```
+
+### 8.10 批量插入与更新
+
+```python
+from sqlalchemy import insert, update
+
+
+# ── 批量插入（比逐条 insert 快 10-100 倍） ──────────
+
+# 方式一：逐条 add（适合少量数据，< 100 条）
+for i in range(10):
+    db.add(Item(title=f"item {i}", owner_id=1))
+
+# 方式二：bulk_insert_mappings（适合大量数据，100-10000 条）
+await db.execute(
+    insert(Item),
+    [
+        {"title": f"item {i}", "owner_id": 1}
+        for i in range(1000)
+    ]
+)
+# 注意：bulk insert 不会触发 ORM 事件，也不会自动设置 created_at
+
+# 方式三：批量更新
+await db.execute(
+    update(Item)
+    .where(Item.owner_id == 1)
+    .values(is_done=True)
+)
+
+
+# ── upsert（存在则更新，不存在则插入，MySQL 语法）──
+
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+
+stmt = mysql_insert(Item).values(
+    id=1, title="upserted", owner_id=1
+)
+stmt = stmt.on_duplicate_key_update(title=stmt.inserted.title)
+await db.execute(stmt)
+```
+
+### 8.11 并发控制
+
+```python
+from sqlalchemy import select
+
+
+# ── 问题场景 ────────────────────────────────────────
+# 用户 A 和 B 同时读取库存 = 1，各自下单，最终库存变成 -1
+
+# ── 方案一：悲观锁（适合写多读少） ──────────────────
+# 查询时锁定该行，其他事务必须等待
+result = await db.execute(
+    select(Item).where(Item.id == item_id).with_for_update()
+)
+item = result.scalar_one_or_none()
+# 在当前事务提交前，其他事务无法修改这条记录
+if item.stock < quantity:
+    raise HTTPException(400, "Insufficient stock")
+item.stock -= quantity
+# 事务提交后解锁
+
+
+# ── 方案二：乐观锁（适合读多写少） ──────────────────
+# 在模型中加版本号字段，更新时检查版本号
+
+class Product(Base):
+    __tablename__ = "products"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    stock: Mapped[int]
+    version: Mapped[int] = mapped_column(default=1)  # 版本号
+
+
+# 更新时验证版本号
+result = await db.execute(
+    update(Product)
+    .where(
+        Product.id == product_id,
+        Product.version == current_version,  # 版本号匹配才更新
+    )
+    .values(stock=new_stock, version=current_version + 1)
+)
+if result.rowcount == 0:
+    # 版本号不匹配，说明被其他事务修改了
+    raise HTTPException(409, "Conflict: product was modified by another user")
+
+
+# ── 选择策略 ─────────────────────────────────────────
+#
+# 悲观锁 with_for_update()：
+#   - 适合写冲突频繁的场景
+#   - 会降低并发性能（事务排队）
+#
+# 乐观锁 version 字段：
+#   - 适合写冲突少的场景
+#   - 不阻塞读操作，性能好
+#   - 冲突时需重试（客户端重新读取并重试）
 ```
 
 ---
@@ -1667,7 +1902,7 @@ uv add --dev pytest httpx pytest-asyncio
 asyncio_mode = "auto"
 ```
 
-### 14.2 编写测试
+### 16.2 编写测试
 
 ```python
 import pytest
@@ -1701,12 +1936,89 @@ async def test_create_item(client: AsyncClient):
     assert "id" in data
 ```
 
-### 14.3 运行测试
+### 16.3 运行测试
 
 ```bash
 uv run pytest -v
 uv run pytest -v -k "item"     # 按名称筛选
 uv run pytest -v --cov=app     # 覆盖率
+```
+
+### 16.4 测试数据库
+
+```python
+import pytest
+from httpx import AsyncClient, ASGITransport
+
+from app.main import app
+from app.database import engine, Base, async_session
+
+
+@pytest.fixture(autouse=True)
+async def setup_database():
+    """每个测试函数前重建表结构，保证测试隔离"""
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+
+
+@pytest.fixture
+async def client():
+    transport = ASGITransport(app=app)
+    with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+
+
+@pytest.fixture
+async def db():
+    async with async_session() as session:
+        yield session
+
+
+@pytest.fixture
+async def auth_headers(client: AsyncClient, db: AsyncSession):
+    """注册用户并返回认证头"""
+    await client.post("/api/v1/auth/register", json={
+        "username": "testuser",
+        "email": "test@example.com",
+        "password": "testpass123",
+    })
+    resp = await client.post("/api/v1/auth/login", data={
+        "username": "testuser",
+        "password": "testpass123",
+    })
+    token = resp.json()["access_token"]
+    return {"Authorization": f"Bearer {token}"}
+
+
+# 使用
+@pytest.mark.asyncio
+async def test_create_item(client: AsyncClient, auth_headers: dict):
+    response = await client.post(
+        "/api/v1/items/",
+        json={"title": "test"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 201
+```
+
+### 16.5 Mock 外部服务
+
+```python
+from unittest.mock import patch, AsyncMock
+
+
+@pytest.mark.asyncio
+async def test_send_email():
+    """Mock 邮件服务，不真实发送"""
+    with patch("app.services.email.EmailService.send", new_callable=AsyncMock) as mock_send:
+        mock_send.return_value = True
+
+        response = await client.post("/auth/forgot-password", json={"email": "test@test.com"})
+        assert response.status_code == 200
+        mock_send.assert_called_once()
 ```
 
 ---
@@ -1786,6 +2098,152 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+```
+
+### 多环境配置（dev/staging/prod）
+
+```python
+# ── .env.dev（开发环境） ─────────────────────────────
+# DATABASE_URL=mysql+aiomysql://root:root@localhost:3306/app_db
+# DEBUG=true
+
+# ── .env.prod（生产环境） ────────────────────────────
+# DATABASE_URL=mysql+aiomysql://user:pass@prod-host:3306/app_db
+# DEBUG=false
+# JWT_SECRET_KEY=real-secret-key
+
+# ── config.py 中按环境加载不同的文件 ────────────────
+
+import os
+
+
+class Settings(BaseSettings):
+    environment: str = "development"
+    debug: bool = False
+    database_url: str
+    jwt_secret_key: str
+    ...
+
+    model_config = {
+        "env_file": f".env.{os.getenv('APP_ENV', 'dev')}",  # 根据 APP_ENV 加载不同文件
+        "env_file_encoding": "utf-8",
+        "extra": "ignore",  # 忽略多余的环境变量
+    }
+
+
+# 运行方式：
+# APP_ENV=prod uv run uvicorn app.main:app
+
+# 或者使用 Docker 环境变量覆盖（推荐）：
+# docker run -e DATABASE_URL=... -e JWT_SECRET_KEY=... myapp
+```
+
+### 17.4 Sentry 错误监控
+
+```bash
+uv add sentry-sdk
+```
+
+```python
+import sentry_sdk
+from sentry_sdk.integrations.fastapi import FastApiIntegration
+from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
+
+from app.config import get_settings
+
+settings = get_settings()
+
+sentry_sdk.init(
+    dsn=settings.sentry_dsn,   # 从 Sentry 项目设置中获取
+    integrations=[
+        FastApiIntegration(),
+        SqlalchemyIntegration(),
+    ],
+    traces_sample_rate=0.1,     # 性能追踪采样率 10%
+    environment=settings.environment,  # "development" / "staging" / "production"
+)
+
+
+# 手动捕获异常
+try:
+    risky_operation()
+except Exception as e:
+    sentry_sdk.capture_exception(e)
+
+
+# 设置用户上下文（方便定位问题用户）
+from sentry_sdk import set_user
+set_user({"id": current_user.id, "username": current_user.username})
+```
+
+### 17.5 GitHub Actions CI/CD
+
+`.github/workflows/ci.yml`：
+
+```yaml
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  DATABASE_URL: sqlite+aiosqlite:///./test.db
+  JWT_SECRET_KEY: test-secret-key
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: latest
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Type check
+        run: uv run mypy app/
+
+      - name: Test
+        run: uv run pytest -v --cov=app --cov-report=xml
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t myapp:latest .
+
+      - name: Push to registry
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+          docker tag myapp:latest $DOCKER_USERNAME/myapp:latest
+          docker push $DOCKER_USERNAME/myapp:latest
 ```
 
 ---
@@ -1936,7 +2394,7 @@ class PostV2(PostV1):
 | CORS 生产环境设为 `*` | 严格限制来源 |
 | 在路由中直接操作数据库 | 通过 crud 层封装 |
 
-### 18.5 学习路径总结
+### 18.6 学习路径总结
 
 ```
 第一阶段：基础
@@ -1972,7 +2430,92 @@ class PostV2(PostV1):
 
 ---
 
-## 19. 参考链接
+## 19. 常见错误排查
+
+### 19.1 启动时报错
+
+| 错误信息 | 原因 | 解决方法 |
+|---|---|---|
+| `ModuleNotFoundError: No module named 'app'` | 运行目录不对 | 确保在 `backend/` 目录下执行 `uvicorn app.main:app` |
+| `Error loading ASGI app. Could not import module "app.main"` | `main.py` 位置错误 | `main.py` 应该在 `app/main.py`，不是项目根目录 |
+| `sqlalchemy.exc.OperationalError: Can't connect to MySQL server` | MySQL 未启动或连接信息错误 | 检查 `.env` 中 `DATABASE_URL` 和 MySQL 服务状态 |
+| `ModuleNotFoundError: No module named 'aiomysql'` | 缺少依赖 | 执行 `uv add aiomysql` |
+| `pydantic_core.ValidationError: 1 validation error for Settings` | `.env` 文件缺少必要字段 | 检查 `.env` 是否包含所有必填变量 |
+| `ImportError: cannot import name 'AsyncGenerator' from 'collections.abc'` | Python 版本过低 | 需要使用 Python >= 3.10 |
+
+### 19.2 运行时错误
+
+```python
+# ── AttributeError: 'AsyncSession' object has no attribute 'query'
+# SQLAlchemy 2.0 异步会话使用 execute()，不是 query()
+# ❌ 错误
+items = db.query(Item).all()
+# ✅ 正确
+result = await db.execute(select(Item))
+items = result.scalars().all()
+
+
+# ── RuntimeError: You cannot use AsyncToSync in the same process
+# 在异步函数中调用了同步数据库操作
+# ✅ 要么全部异步，要么全部同步，不要混用
+
+
+# ── pydantic.ValidationError: Field required (type=missing)
+# 请求体缺少必填字段
+# ✅ 检查 JSON 请求体是否包含了所有必填字段
+
+
+# ── sqlalchemy.exc.IntegrityError: (1062, "Duplicate entry 'admin' for key 'users.username'")
+# 唯一约束冲突（用户名/邮箱重复）
+# ✅ 操作前先检查唯一字段是否存在
+
+
+# ── sqlalchemy.exc.OperationalError: (2006, "MySQL server has gone away")
+# 数据库连接超时断开
+# ✅ 设置 pool_recycle=3600（小于 MySQL 的 wait_timeout）
+```
+
+### 19.3 Alembic 迁移问题
+
+| 问题 | 原因 | 解决 |
+|---|---|---|
+| `Target database is not up to date` | 迁移版本落后 | 执行 `alembic upgrade head` |
+| `No changes detected` | 模型未 import | 在 `alembic/env.py` 中 import 所有模型 |
+| `FAILED: No such revision` | 迁移文件被删除 | 删除 `alembic/versions/` 中手动删除的文件，或用 `alembic stamp head` |
+| `Can't locate revision identified by` | 迁移历史不一致 | `alembic stamp head` 标记当前状态 |
+
+### 19.4 Docker 问题
+
+```bash
+# ── port is already allocated
+# 端口被占用
+# 方案一：停掉占用端口的服务
+lsof -i :8000
+kill -9 <PID>
+
+# 方案二：在 docker-compose.yml 中更换端口
+ports:
+  - "8001:8000"
+
+
+# ── container name already in use
+# 容器未清理
+docker compose down
+
+
+# ── ERROR: failed to solve: failed to read dockerfile
+# Dockerfile 不存在
+ls Dockerfile*
+
+
+# ── Module not found in Docker container
+# .dockerignore 排除了源码 或 Dockerfile 未 COPY 源码
+# 检查 Dockerfile 中是否有 COPY . . 或 COPY app/ app/
+```
+
+---
+
+## 20. 参考链接
 
 ### 官方文档
 
