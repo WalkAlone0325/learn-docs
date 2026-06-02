@@ -181,7 +181,23 @@ useSeoMeta({
 
 `<NuxtPage />` 是路由出口，相当于 Vue Router 的 `<RouterView />`。
 
-### 2.4 应用生命周期
+### 2.4 知识依赖关系
+
+各章节之间并非完全独立，了解依赖关系有助于选择学习路径：
+
+```
+认证(14) ──→ 服务端路由(10) + 组合式函数(7) + 中间件(12)
+数据获取(8) ──→ 路由(5) + 组合式函数(7)
+服务端路由(10) ──→ 路由(5) + 工具链(1)
+测试(16) ──→ 组合式函数(7) + 组件(6)
+部署(17) ──→ 测试(16) + 配置(2)
+SEO(15) ──→ 数据获取(8) + 路由(5)
+样式(13) ──→ 组件(6)
+```
+
+建议阅读顺序：1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15 → 16 → 17 → 18 → 19 → 20
+
+### 2.5 应用生命周期
 
 ```
 Nuxt 启动
@@ -232,9 +248,11 @@ onMounted(() => {
 
 ### 3.2 响应式核心
 
+为什么需要响应式？传统 JavaScript 中，修改变量后 DOM 不会自动更新。Vue 的响应式系统追踪状态变化并自动更新视图。
+
 ```vue
 <script setup lang="ts">
-import { ref, reactive, shallowRef, computed, watch } from 'vue'
+import { ref, reactive, shallowRef, computed, watch, isRef } from 'vue'
 
 // ref: 基本响应式
 const name = ref('Nuxt')
@@ -251,12 +269,25 @@ const greeting = computed(() => `Hello, ${name.value}!`)
 </script>
 ```
 
+```vue
+<script setup lang="ts">
+// ❌ 错误：直接解构会丢失响应性
+const { count } = reactive({ count: 0 })
+count++ // 不会触发更新
+
+// ✅ 正确：使用 ref 或 toRefs 保持响应性
+const state = reactive({ count: 0 })
+const count = toRef(state, 'count')
+count.value++ // 触发更新
+</script>
+```
+
 **Key Points:**
 - `ref` 用于基本类型和需要重新赋值的场景
 - `reactive` 用于对象内部属性变更
 - `shallowRef` 对大数组/对象做性能优化
 
-> **💡 Tip:** 在 `<script setup>` 中，ref 在模板中自动解包，不需要 `.value`。
+> **💡 Tip:** 在 `<script setup>` 中，ref 在模板中自动解包，不需要 `.value`。但在 `<script>`（非 setup）中仍需 `.value`。
 
 ### 3.3 Props 与 Emits
 
@@ -988,6 +1019,21 @@ const { data, status } = await useLazyFetch('/api/heavy-data')
 | `$fetch` | 交互事件中的请求 |
 | `useNuxtData` | 访问已缓存的数据 |
 
+```vue
+<script setup lang="ts">
+// ❌ 错误：直接在 setup 中使用 $fetch 获取初始数据
+// 服务端请求一次，客户端水合后又请求一次 → 双重请求
+const data = ref(null)
+const { data: serverData } = await useAsyncData('key', () => $fetch('/api/data'))
+// ✅ 正确：等待 useAsyncData 返回，服务端和客户端共享数据
+
+// ❌ 错误：忘记 await useFetch
+const { data } = useFetch('/api/posts') // data 值可能为 undefined
+// ✅ 正确：await 确保数据可用
+const { data } = await useFetch('/api/posts')
+</script>
+```
+
 > **💡 Tip:** 服务端到客户端的数据传递通过 `payload` 实现，这是 Nuxt 自动处理的。不要直接使用 `fetch` 在 setup 中获取初始数据，否则会双重请求。
 
 ---
@@ -1117,7 +1163,21 @@ export const useUserStore = defineStore('user', () => {
 <script setup lang="ts">
 // ✅ 正确：在 setup 中初始化
 const store = useUserStore()
-if (import.meta.server) {
+if (!store.user && import.meta.server) {
+  await store.fetchUser()
+}
+</script>
+```
+
+```vue
+<script setup lang="ts">
+// ❌ 错误：在模块顶层初始化（SSR 中会跨请求污染）
+const store = useUserStore()
+await store.fetchUser() // 所有请求共享同一个状态
+
+// ✅ 正确：在组件 setup 中按需初始化
+const store = useUserStore()
+if (!store.user) {
   await store.fetchUser()
 }
 </script>
@@ -1243,7 +1303,13 @@ export default defineEventHandler((event) => {
 ### 10.6 错误处理
 
 ```ts
-// server/api/posts/[id].ts
+// ❌ 错误：直接返回错误，没有状态码和结构化信息
+export default defineEventHandler(() => {
+  return { error: 'Not found' }
+})
+
+// ✅ 正确：使用 createError 抛出结构化错误
+// 客户端可以统一处理 statusCode 和 message
 export default defineEventHandler((event) => {
   const id = getRouterParam(event, 'id')
   const post = findPost(id)
@@ -1257,6 +1323,15 @@ export default defineEventHandler((event) => {
 
   return post
 })
+```
+
+```ts
+// 客户端统一处理错误
+onResponseError({ response }) {
+  if (response.status === 401) navigateTo('/login')
+  if (response.status === 403) showError('权限不足')
+  if (response.status === 429) showError('请求过于频繁')
+}
 ```
 
 ### 10.7 服务端工具
@@ -1616,11 +1691,18 @@ body {
 
 ### 14.3 服务端实现
 
+```bash
+pnpm add jsonwebtoken
+pnpm add -D @types/jsonwebtoken
+```
+
 ```ts
 // server/utils/auth.ts
 import jwt from 'jsonwebtoken'
 
 const SECRET = process.env.JWT_SECRET || 'dev-secret-change-in-production'
+
+> **💡 Tip:** 在 Nuxt 的 server/ 目录中使用 TypeScript 时，`import jwt from 'jsonwebtoken'` 可能报类型错误。可以在 `server/tsconfig.json` 中配置 `"esModuleInterop": true`，或使用 `const jwt = require('jsonwebtoken') as typeof import('jsonwebtoken')`。
 
 export interface JwtPayload {
   userId: number
